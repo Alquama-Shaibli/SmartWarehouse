@@ -1,0 +1,11 @@
+name: smart-warehouse-env
+version: 1.0
+
+tasks:
+  - easy
+  - medium
+  - hard
+
+observation_space: Observation
+action_space: Action
+reward_space: Reward
