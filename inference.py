@@ -1,7 +1,7 @@
 import os
 from openai import OpenAI
-from warehouse_env import WarehouseEnv
-from models import Action
+from warehouse_env.env_core import WarehouseEnv
+from warehouse_env.models import Action
 
 # Will use fake API logic if API key isn't provided/valid, or actual LLM
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", "dummy-key"))
