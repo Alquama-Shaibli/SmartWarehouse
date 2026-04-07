@@ -2,20 +2,36 @@ from fastapi import FastAPI
 from warehouse_env.env_core import WarehouseEnv
 from warehouse_env.models import Action
 
-app = FastAPI()
+app = FastAPI(title="Smart Warehouse Environment")
+
+# Initialize environment
 env = WarehouseEnv()
 
 
-# ✅ Reset (POST required for OpenEnv)
+# -----------------------------
+# HEALTH CHECK (IMPORTANT for HF)
+# -----------------------------
+@app.get("/")
+def root():
+    return {"status": "running"}
+
+
+# -----------------------------
+# RESET (OpenEnv expects POST)
+# -----------------------------
 @app.post("/reset")
 def reset():
-    return env.reset()
+    obs = env.reset()
+    return obs.dict()
 
 
-# ✅ Step
+# -----------------------------
+# STEP
+# -----------------------------
 @app.post("/step")
 def step(action: Action):
     obs, reward, done, info = env.step(action)
+
     return {
         "observation": obs.dict(),
         "reward": reward.value,
@@ -24,18 +40,24 @@ def step(action: Action):
     }
 
 
-# ✅ State
+# -----------------------------
+# STATE
+# -----------------------------
 @app.get("/state")
 def state():
     return env.state()
 
 
-# ✅ OpenEnv entrypoint (IMPORTANT)
+# -----------------------------
+# OPENENV ENTRYPOINT (CRITICAL)
+# -----------------------------
 def main():
     return app
 
 
-# ✅ Local run only (safe)
+# -----------------------------
+# LOCAL RUN ONLY
+# -----------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server.app:app", host="0.0.0.0", port=7860, reload=True)
+    uvicorn.run("server.app:app", host="0.0.0.0", port=7860)
