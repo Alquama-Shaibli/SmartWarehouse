@@ -19,7 +19,7 @@ MAX_STEPS = 50
 
 
 def get_heuristic_action(obs, env, Action):
-    """Rule-based fallback agent (your original logic, preserved)."""
+    """Rule-based fallback agent."""
     sm = env.state_manager
     rx, ry = obs.robot_position
     gx, gy = obs.goal
@@ -69,16 +69,61 @@ def get_heuristic_action(obs, env, Action):
     return Action(action_type="move", direction="right")
 
 
-def run_task(task_name: str):
+def make_llm_client():
+    """
+    Build an OpenAI-compatible client pointed at the hackathon's LiteLLM proxy.
+
+    The validator checks that API_BASE_URL and API_KEY were used.
+    NEVER hardcode keys or use your own OpenAI credentials here.
+    """
+    from openai import OpenAI
+
+    api_base = os.environ.get("API_BASE_URL")
+    api_key  = os.environ.get("API_KEY")
+
+    if not api_base or not api_key:
+        raise ValueError(
+            "API_BASE_URL or API_KEY env vars not set. "
+            "The hackathon validator injects these automatically."
+        )
+
+    return OpenAI(base_url=api_base, api_key=api_key)
+
+
+def get_llm_action(client, obs, Action):
+    """Call the LiteLLM proxy and parse the response into an Action."""
+    model = os.environ.get("MODEL_NAME", "gpt-3.5-turbo")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a warehouse robot planner. "
+                    "Reply with exactly one word: pick, drop, or move."
+                ),
+            },
+            {"role": "user", "content": str(obs.dict())},
+        ],
+        max_tokens=20,
+    )
+    content = response.choices[0].message.content.lower()
+    if "pick" in content:
+        return Action(action_type="pick")
+    elif "drop" in content:
+        return Action(action_type="drop")
+    else:
+        return Action(action_type="move", direction="right")
+
+
+def run_task(task_name: str, client):
     """Run one task and emit the required structured stdout blocks."""
 
-    # ── [START] block ────────────────────────────────────────────────────────
+    # ── [START] ──────────────────────────────────────────────────────────────
     print(f"[START] task={task_name}", flush=True)
 
-    # ── Environment setup ────────────────────────────────────────────────────
     if WarehouseEnv is None or Action is None:
-        # Environment not available — emit a minimal valid trace so the
-        # validator can still parse [START]/[STEP]/[END] blocks.
+        # Env unavailable — emit minimal valid trace so validator can parse
         print(f"[STEP] step=1 reward=0.0", flush=True)
         print(f"[END] task={task_name} score=0.0 steps=1", flush=True)
         return
@@ -93,45 +138,22 @@ def run_task(task_name: str):
     total_reward = 0.0
     step_count = 0
 
-    # ── Optional LLM client (falls back to heuristic if unavailable) ─────────
-    client = None
-    try:
-        from openai import OpenAI
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        if api_key and api_key != "dummy-key":
-            client = OpenAI(api_key=api_key)
-    except ImportError:
-        pass
-
-    # ── Main episode loop ────────────────────────────────────────────────────
+    # ── Episode loop ─────────────────────────────────────────────────────────
     while not done and step_count < MAX_STEPS:
         action = None
 
-        # Try LLM first
+        # Primary: always try the LiteLLM proxy first (validator requires this)
         if client is not None:
             try:
-                response = client.chat.completions.create(
-                    model=os.getenv("MODEL_NAME", "gpt-3.5-turbo"),
-                    messages=[
-                        {"role": "system", "content": "You are a warehouse robot planner."},
-                        {"role": "user", "content": str(obs.dict())}
-                    ]
-                )
-                content = response.choices[0].message.content.lower()
-                if "pick" in content:
-                    action = Action(action_type="pick")
-                elif "drop" in content:
-                    action = Action(action_type="drop")
-                else:
-                    action = Action(action_type="move", direction="right")
-            except Exception:
+                action = get_llm_action(client, obs, Action)
+            except Exception as e:
+                print(f"# LLM call failed at step {step_count + 1}: {e}", flush=True)
                 action = None
 
-        # Fall back to heuristic
+        # Fallback: heuristic only when LLM call fails
         if action is None:
             action = get_heuristic_action(obs, env, Action)
 
-        # Safety net
         if action is None:
             action = Action(action_type="move", direction="right")
 
@@ -140,20 +162,28 @@ def run_task(task_name: str):
         total_reward += reward_val
         step_count += 1
 
-        # ── [STEP] block (required by validator) ────────────────────────────
+        # ── [STEP] ───────────────────────────────────────────────────────────
         print(f"[STEP] step={step_count} reward={reward_val:.4f}", flush=True)
 
-    # Normalise score to [0, 1] range expected by the validator
+    # Normalise score to [0, 1]
     max_possible = max(step_count, 1) * 1.0
     score = min(max(total_reward / max_possible, 0.0), 1.0)
 
-    # ── [END] block (required by validator) ─────────────────────────────────
+    # ── [END] ─────────────────────────────────────────────────────────────────
     print(f"[END] task={task_name} score={score:.4f} steps={step_count}", flush=True)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Build the LiteLLM proxy client ONCE — this triggers the "last_active"
+    # update that the validator checks. Must use API_BASE_URL + API_KEY.
+    try:
+        client = make_llm_client()
+    except Exception as e:
+        print(f"# FATAL: Could not create LLM client: {e}", flush=True)
+        client = None
+
     for task in TASKS:
-        run_task(task)
+        run_task(task, client)
 
     sys.stdout.flush()
