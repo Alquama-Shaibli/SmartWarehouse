@@ -1,7 +1,21 @@
 import os
 import sys
 
-# ── Env import with graceful fallback ────────────────────────────────────────
+# ── Environment variables exactly as required by the sample ──────────────────
+API_BASE_URL     = os.getenv("API_BASE_URL", "<your-active-api-base-url>")
+MODEL_NAME       = os.getenv("MODEL_NAME",   "<your-active-model-name>")
+HF_TOKEN         = os.getenv("HF_TOKEN")                  # no default
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")           # optional
+
+# ── OpenAI client configured via the injected env variables ──────────────────
+from openai import OpenAI
+
+client = OpenAI(
+    base_url=API_BASE_URL,
+    api_key=HF_TOKEN or "dummy-key",   # HF_TOKEN is the auth key for the proxy
+)
+
+# ── Env import with graceful fallback ─────────────────────────────────────────
 try:
     from warehouse_env.env_core import WarehouseEnv
     from warehouse_env.models import Action
@@ -13,88 +27,51 @@ except ImportError:
         WarehouseEnv = None
         Action = None
 
-# ── Tasks defined in openenv.yaml ────────────────────────────────────────────
-TASKS = ["easy", "medium", "hard"]
+# ── Tasks & constants ─────────────────────────────────────────────────────────
+TASKS     = ["easy", "medium", "hard"]
 MAX_STEPS = 50
 
 
-def get_heuristic_action(obs, env, Action):
-    """Rule-based fallback agent."""
+# ── Heuristic fallback agent ──────────────────────────────────────────────────
+def get_heuristic_action(obs, env):
     sm = env.state_manager
     rx, ry = obs.robot_position
     gx, gy = obs.goal
     cx, cy = sm.charge_station
 
     if obs.battery < 20 and sm.robot != [cx, cy]:
-        if rx > cx:
-            return Action(action_type="move", direction="up")
-        elif rx < cx:
-            return Action(action_type="move", direction="down")
-        elif ry > cy:
-            return Action(action_type="move", direction="left")
-        elif ry < cy:
-            return Action(action_type="move", direction="right")
+        if rx > cx:   return Action(action_type="move", direction="up")
+        elif rx < cx: return Action(action_type="move", direction="down")
+        elif ry > cy: return Action(action_type="move", direction="left")
+        else:         return Action(action_type="move", direction="right")
+
     elif len(sm.carrying) < 3:
-        target_item_pos = None
+        target = None
         for item, pos in sm.inventory.items():
             if item not in sm.carrying:
-                target_item_pos = pos
+                target = pos
                 break
-        if target_item_pos:
-            ix, iy = target_item_pos
-            if rx == ix and ry == iy:
-                return Action(action_type="pick")
-            elif rx < ix:
-                return Action(action_type="move", direction="down")
-            elif rx > ix:
-                return Action(action_type="move", direction="up")
-            elif ry < iy:
-                return Action(action_type="move", direction="right")
-            elif ry > iy:
-                return Action(action_type="move", direction="left")
-        else:
-            return Action(action_type="move", direction="down")
+        if target:
+            ix, iy = target
+            if rx == ix and ry == iy: return Action(action_type="pick")
+            elif rx < ix:  return Action(action_type="move", direction="down")
+            elif rx > ix:  return Action(action_type="move", direction="up")
+            elif ry < iy:  return Action(action_type="move", direction="right")
+            else:          return Action(action_type="move", direction="left")
+        return Action(action_type="move", direction="down")
+
     else:
-        if rx == gx and ry == gy:
-            return Action(action_type="drop")
-        elif rx < gx:
-            return Action(action_type="move", direction="down")
-        elif rx > gx:
-            return Action(action_type="move", direction="up")
-        elif ry < gy:
-            return Action(action_type="move", direction="right")
-        elif ry > gy:
-            return Action(action_type="move", direction="left")
-
-    return Action(action_type="move", direction="right")
+        if rx == gx and ry == gy: return Action(action_type="drop")
+        elif rx < gx:  return Action(action_type="move", direction="down")
+        elif rx > gx:  return Action(action_type="move", direction="up")
+        elif ry < gy:  return Action(action_type="move", direction="right")
+        else:          return Action(action_type="move", direction="left")
 
 
-def make_llm_client():
-    """
-    Build an OpenAI-compatible client pointed at the hackathon's LiteLLM proxy.
-
-    The validator checks that API_BASE_URL and API_KEY were used.
-    NEVER hardcode keys or use your own OpenAI credentials here.
-    """
-    from openai import OpenAI
-
-    api_base = os.environ.get("API_BASE_URL")
-    api_key  = os.environ.get("API_KEY")
-
-    if not api_base or not api_key:
-        raise ValueError(
-            "API_BASE_URL or API_KEY env vars not set. "
-            "The hackathon validator injects these automatically."
-        )
-
-    return OpenAI(base_url=api_base, api_key=api_key)
-
-
-def get_llm_action(client, obs, Action):
-    """Call the LiteLLM proxy and parse the response into an Action."""
-    model = os.environ.get("MODEL_NAME", "gpt-3.5-turbo")
+# ── LLM call via proxy ────────────────────────────────────────────────────────
+def get_llm_action(obs):
     response = client.chat.completions.create(
-        model=model,
+        model=MODEL_NAME,
         messages=[
             {
                 "role": "system",
@@ -108,22 +85,17 @@ def get_llm_action(client, obs, Action):
         max_tokens=20,
     )
     content = response.choices[0].message.content.lower()
-    if "pick" in content:
-        return Action(action_type="pick")
-    elif "drop" in content:
-        return Action(action_type="drop")
-    else:
-        return Action(action_type="move", direction="right")
+    if "pick"  in content: return Action(action_type="pick")
+    if "drop"  in content: return Action(action_type="drop")
+    return Action(action_type="move", direction="right")
 
 
-def run_task(task_name: str, client):
-    """Run one task and emit the required structured stdout blocks."""
-
-    # ── [START] ──────────────────────────────────────────────────────────────
+# ── Task runner ───────────────────────────────────────────────────────────────
+def run_task(task_name: str):
+    # [START] — required structured output
     print(f"[START] task={task_name}", flush=True)
 
     if WarehouseEnv is None or Action is None:
-        # Env unavailable — emit minimal valid trace so validator can parse
         print(f"[STEP] step=1 reward=0.0", flush=True)
         print(f"[END] task={task_name} score=0.0 steps=1", flush=True)
         return
@@ -133,57 +105,38 @@ def run_task(task_name: str, client):
     except TypeError:
         env = WarehouseEnv()
 
-    obs = env.reset()
-    done = False
+    obs          = env.reset()
+    done         = False
     total_reward = 0.0
-    step_count = 0
+    step_count   = 0
 
-    # ── Episode loop ─────────────────────────────────────────────────────────
     while not done and step_count < MAX_STEPS:
-        action = None
-
-        # Primary: always try the LiteLLM proxy first (validator requires this)
-        if client is not None:
-            try:
-                action = get_llm_action(client, obs, Action)
-            except Exception as e:
-                print(f"# LLM call failed at step {step_count + 1}: {e}", flush=True)
-                action = None
-
-        # Fallback: heuristic only when LLM call fails
-        if action is None:
-            action = get_heuristic_action(obs, env, Action)
+        # Try LLM via proxy first; fall back to heuristic only on error
+        try:
+            action = get_llm_action(obs)
+        except Exception as e:
+            print(f"# LLM error step {step_count + 1}: {e}", flush=True)
+            action = get_heuristic_action(obs, env)
 
         if action is None:
             action = Action(action_type="move", direction="right")
 
         obs, reward, done, _ = env.step(action)
-        reward_val = float(reward.value) if hasattr(reward, "value") else float(reward)
+        reward_val    = float(reward.value) if hasattr(reward, "value") else float(reward)
         total_reward += reward_val
-        step_count += 1
+        step_count   += 1
 
-        # ── [STEP] ───────────────────────────────────────────────────────────
+        # [STEP] — required structured output
         print(f"[STEP] step={step_count} reward={reward_val:.4f}", flush=True)
 
-    # Normalise score to [0, 1]
-    max_possible = max(step_count, 1) * 1.0
-    score = min(max(total_reward / max_possible, 0.0), 1.0)
+    score = min(max(total_reward / max(step_count, 1), 0.0), 1.0)
 
-    # ── [END] ─────────────────────────────────────────────────────────────────
+    # [END] — required structured output
     print(f"[END] task={task_name} score={score:.4f} steps={step_count}", flush=True)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Build the LiteLLM proxy client ONCE — this triggers the "last_active"
-    # update that the validator checks. Must use API_BASE_URL + API_KEY.
-    try:
-        client = make_llm_client()
-    except Exception as e:
-        print(f"# FATAL: Could not create LLM client: {e}", flush=True)
-        client = None
-
     for task in TASKS:
-        run_task(task, client)
-
+        run_task(task)
     sys.stdout.flush()
